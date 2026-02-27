@@ -1,0 +1,3 @@
+[submodule "Smena.Client"]
+	path = Smena.Client
+	url = https://github.com/EvrkMs/Smena.Client
