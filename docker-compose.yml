@@ -1,0 +1,17 @@
+services:
+  update-server:
+    container_name: smena-update-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    expose:
+      - "5100"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+    networks:
+      - smena_edge
+
+networks:
+  smena_edge:
+    external: true
+    driver: bridge

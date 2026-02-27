@@ -1,0 +1,11 @@
+.git
+.vs
+bin
+obj
+**/bin/
+**/obj/
+*.user
+*.suo
+.idea
+.DS_Store
+Thumbs.db
