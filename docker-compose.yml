@@ -10,6 +10,7 @@ services:
       ASPNETCORE_ENVIRONMENT: "Production"
     networks:
       - smena_edge
+    restart: unless-stopped
 
 networks:
   smena_edge:
