@@ -1,3 +1,5 @@
+name: smena
+
 services:
   update-server:
     container_name: smena-update-server
