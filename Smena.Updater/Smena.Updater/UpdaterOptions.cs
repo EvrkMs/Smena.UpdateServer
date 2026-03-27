@@ -45,7 +45,8 @@ internal sealed class UpdaterOptions
         var argsMap = ParseArgs(argsWithoutMode);
         var appDirectory = argsMap.GetValueOrDefault("app-dir")?.Trim() ?? string.Empty;
         var entryExeOverride = argsMap.GetValueOrDefault("entry-exe");
-        var apiKeyOverride = argsMap.GetValueOrDefault("api-key");
+        var apiKeyOverride = argsMap.GetValueOrDefault("api-key")
+            ?? Environment.GetEnvironmentVariable("SMENA_UPDATER_API_KEY");
         var assumeYes = argsMap.ContainsKey("yes");
         var noLaunch = argsMap.ContainsKey("no-launch");
         var selfUpdateFromPath = argsMap.GetValueOrDefault("self-update-from")?.Trim();

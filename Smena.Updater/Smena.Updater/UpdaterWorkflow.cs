@@ -618,6 +618,14 @@ internal sealed class UpdaterWorkflow
                 UseShellExecute = false,
                 WorkingDirectory = extractPath
             };
+
+            // Pass API key via environment variable instead of command-line to avoid
+            // exposure in process listings.
+            if (!string.IsNullOrWhiteSpace(options.ApiKeyOverride))
+            {
+                startInfo.Environment["SMENA_UPDATER_API_KEY"] = options.ApiKeyOverride;
+            }
+
             Process.Start(startInfo);
 
             return SelfUpdateAction.Relaunched;
@@ -645,8 +653,8 @@ internal sealed class UpdaterWorkflow
             parts.Add($"--app-dir \"{options.AppDirectory}\"");
         if (!string.IsNullOrWhiteSpace(options.EntryExeOverride))
             parts.Add($"--entry-exe \"{options.EntryExeOverride}\"");
-        if (!string.IsNullOrWhiteSpace(options.ApiKeyOverride))
-            parts.Add($"--api-key \"{options.ApiKeyOverride}\"");
+        // API key is passed via SMENA_UPDATER_API_KEY env var (set on ProcessStartInfo)
+        // instead of command-line to avoid exposure in process listings.
         if (!string.IsNullOrWhiteSpace(options.GrpcAddressOverride))
             parts.Add($"--grpc-address \"{options.GrpcAddressOverride}\"");
         if (options.NoLaunch)
@@ -933,7 +941,8 @@ internal sealed class UpdaterWorkflow
         }
         catch
         {
-            return true;
+            // Can't verify — treat as unrelated process to avoid killing wrong processes.
+            return false;
         }
     }
 
@@ -1012,6 +1021,7 @@ internal sealed class UpdaterWorkflow
 
     private static void CopyDirectory(string sourceDir, string destinationDir)
     {
+        var skipped = new List<string>();
         foreach (var sourcePath in Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(sourceDir, sourcePath);
@@ -1024,7 +1034,15 @@ internal sealed class UpdaterWorkflow
             }
             catch (IOException)
             {
-                // Skip locked files (usually updater itself).
+                // Only tolerate skipping the updater's own executable.
+                if (relative.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
+                    relative.Contains("Updater", StringComparison.OrdinalIgnoreCase))
+                {
+                    skipped.Add(relative);
+                    continue;
+                }
+
+                throw; // Re-throw for other locked files — update is incomplete.
             }
         }
     }
@@ -1058,6 +1076,11 @@ internal sealed class UpdaterWorkflow
     {
         if (Uri.TryCreate(updaterPlanUrl, UriKind.Absolute, out var absolute))
         {
+            if (!string.Equals(absolute.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"Plan/manifest URL must use HTTPS: {updaterPlanUrl}");
+            }
+
             return absolute;
         }
 

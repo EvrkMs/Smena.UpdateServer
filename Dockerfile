@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7-labs
-
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS client-build
 WORKDIR /src
 
