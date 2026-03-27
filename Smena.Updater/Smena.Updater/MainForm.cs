@@ -425,6 +425,7 @@ internal sealed class MainForm : Form, IUpdaterInteraction
 
         statusLabel.Text = update.Stage switch
         {
+            WorkflowStage.SelfUpdateCheck => "Проверка обновления программы обновления...",
             WorkflowStage.ConnectServer => "Устанавливается соединение с сервером...",
             WorkflowStage.EnsureGrpcAddress => "Проверка адреса сервера...",
             WorkflowStage.EnsureApiKey => "Проверка API ключа...",

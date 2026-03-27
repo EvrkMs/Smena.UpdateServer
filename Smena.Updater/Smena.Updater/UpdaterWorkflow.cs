@@ -19,6 +19,7 @@ internal interface IUpdaterInteraction
 internal enum WorkflowStage
 {
     ValidateInput,
+    SelfUpdateCheck,
     EnsureApiKey,
     EnsureGrpcAddress,
     ConnectServer,
@@ -61,6 +62,7 @@ internal static class WorkflowStages
     public static IReadOnlyList<WorkflowStage> Ordered { get; } =
     [
         WorkflowStage.ValidateInput,
+        WorkflowStage.SelfUpdateCheck,
         WorkflowStage.EnsureApiKey,
         WorkflowStage.EnsureGrpcAddress,
         WorkflowStage.ConnectServer,
@@ -82,6 +84,7 @@ internal static class WorkflowStages
     public static string GetTitle(WorkflowStage stage) => stage switch
     {
         WorkflowStage.ValidateInput => "Input validation",
+        WorkflowStage.SelfUpdateCheck => "Updater self-update",
         WorkflowStage.EnsureApiKey => "API key check",
         WorkflowStage.EnsureGrpcAddress => "gRPC address check",
         WorkflowStage.ConnectServer => "Server connection",
@@ -140,6 +143,35 @@ internal sealed class UpdaterWorkflow
             Timeout = TimeSpan.FromSeconds(30)
         };
 
+        // ── Self-update logic ──────────────────────────────────────
+        if (!string.IsNullOrWhiteSpace(options.SelfUpdateFromPath))
+        {
+            // We are running from a temp dir. Copy ourselves over the original updater.
+            Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Running, "Applying updater self-update...");
+            try
+            {
+                var targetPath = options.SelfUpdateFromPath;
+                var currentExe = Environment.ProcessPath;
+                if (!string.IsNullOrWhiteSpace(currentExe) && !string.IsNullOrWhiteSpace(targetPath))
+                {
+                    // Wait briefly for old process to exit
+                    await Task.Delay(500, cancellationToken);
+                    File.Copy(currentExe, targetPath, overwrite: true);
+                }
+
+                Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Success, "Updater updated successfully.");
+            }
+            catch (Exception ex)
+            {
+                Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Failed, $"Self-update copy failed: {ex.Message}");
+                // Continue anyway — old updater still works
+            }
+        }
+        else
+        {
+            SkipStage(WorkflowStage.SelfUpdateCheck, "No self-update in progress.");
+        }
+
         Report(WorkflowStage.ConnectServer, WorkflowStageStatus.Running, "Connecting to update server.");
         var healthUrl = BuildHealthUrl(options.ServerUrl);
         try
@@ -181,6 +213,18 @@ internal sealed class UpdaterWorkflow
         }
 
         Report(WorkflowStage.FetchManifest, WorkflowStageStatus.Success, $"Server version: {remoteManifest.Version}");
+
+        // ── Check for updater self-update (only if not already in self-update continuation) ──
+        if (string.IsNullOrWhiteSpace(options.SelfUpdateFromPath) &&
+            !string.IsNullOrWhiteSpace(remoteManifest.UpdaterManifestUrl))
+        {
+            var selfUpdateResult = await TrySelfUpdateAsync(http, remoteManifest.UpdaterManifestUrl, cancellationToken);
+            if (selfUpdateResult == SelfUpdateAction.Relaunched)
+            {
+                // New updater has been launched; this process should exit.
+                return new WorkflowResult(0, false, "Relaunching with updated updater.");
+            }
+        }
 
         Report(WorkflowStage.FetchUpdaterPlan, WorkflowStageStatus.Running, "Downloading updater.plan.json.");
         UpdaterPlan? updaterPlan = null;
@@ -468,6 +512,152 @@ internal sealed class UpdaterWorkflow
         SkipStage(WorkflowStage.LaunchClient, "Launch is not used in uninstall mode.");
 
         return new WorkflowResult(0, false, "Client uninstalled.");
+    }
+
+    private enum SelfUpdateAction { NoUpdate, Relaunched }
+
+    private async Task<SelfUpdateAction> TrySelfUpdateAsync(
+        HttpClient http,
+        string updaterManifestUrl,
+        CancellationToken cancellationToken)
+    {
+        Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Running, "Checking for updater self-update.");
+
+        RemoteUpdaterManifest? updaterManifest;
+        try
+        {
+            var uri = BuildPlanUri(options.ServerUrl, updaterManifestUrl);
+            updaterManifest = await http.GetFromJsonAsync<RemoteUpdaterManifest>(
+                uri, cancellationToken: cancellationToken);
+        }
+        catch
+        {
+            Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Skipped, "Updater manifest unavailable.");
+            return SelfUpdateAction.NoUpdate;
+        }
+
+        if (updaterManifest == null ||
+            string.IsNullOrWhiteSpace(updaterManifest.Version) ||
+            string.IsNullOrWhiteSpace(updaterManifest.PackageUrl) ||
+            string.IsNullOrWhiteSpace(updaterManifest.Sha256))
+        {
+            Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Skipped, "Updater manifest is invalid.");
+            return SelfUpdateAction.NoUpdate;
+        }
+
+        // Compare local updater version from saved state
+        var updaterDir = Path.GetDirectoryName(Environment.ProcessPath ?? AppContext.BaseDirectory)
+            ?? AppContext.BaseDirectory;
+        var updaterStatePath = Path.Combine(updaterDir, "updater.local.json");
+        var localUpdaterVersion = await TryReadLocalVersionAsync(updaterStatePath, cancellationToken);
+
+        if (string.Equals(localUpdaterVersion, updaterManifest.Version, StringComparison.Ordinal))
+        {
+            Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Success, "Updater is up to date.");
+            return SelfUpdateAction.NoUpdate;
+        }
+
+        // Download and verify new updater
+        Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Running,
+            $"Updater update available: {localUpdaterVersion ?? "none"} -> {updaterManifest.Version}");
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), "SmenaUpdaterSelfUpdate", Guid.NewGuid().ToString("N"));
+        var packagePath = Path.Combine(tempRoot, "updater-package.zip");
+        var extractPath = Path.Combine(tempRoot, "extract");
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            var packageUri = BuildPackageUri(options.ServerUrl, updaterManifest.PackageUrl);
+            await DownloadFileAsync(http, packageUri, packagePath, cancellationToken);
+
+            var hash = await ComputeSha256Async(packagePath, cancellationToken);
+            if (!string.Equals(hash, updaterManifest.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Failed, "Updater package checksum mismatch.");
+                return SelfUpdateAction.NoUpdate;
+            }
+
+            await Task.Run(
+                () => ZipFile.ExtractToDirectory(packagePath, extractPath, overwriteFiles: true),
+                cancellationToken);
+
+            // Save updater version state
+            var newState = new LocalUpdateState
+            {
+                Version = updaterManifest.Version,
+                AppliedAtUtc = DateTimeOffset.UtcNow
+            };
+            await File.WriteAllTextAsync(
+                Path.Combine(extractPath, "updater.local.json"),
+                JsonSerializer.Serialize(newState, jsonOptions),
+                cancellationToken);
+
+            // Find the new updater exe
+            var entryExe = string.IsNullOrWhiteSpace(updaterManifest.EntryExe)
+                ? "Smena.Updater.exe"
+                : updaterManifest.EntryExe;
+            var newUpdaterExe = Path.Combine(extractPath, entryExe);
+            if (!File.Exists(newUpdaterExe))
+            {
+                Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Failed,
+                    $"New updater executable not found: {entryExe}");
+                return SelfUpdateAction.NoUpdate;
+            }
+
+            // Build arguments: same original args + --self-update-from=<current exe path>
+            var currentExePath = Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "Smena.Updater.exe");
+            var args = BuildSelfUpdateArgs(currentExePath);
+
+            Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Success, "Relaunching updated updater.");
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = newUpdaterExe,
+                Arguments = args,
+                UseShellExecute = false,
+                WorkingDirectory = extractPath
+            };
+            Process.Start(startInfo);
+
+            return SelfUpdateAction.Relaunched;
+        }
+        catch (Exception ex)
+        {
+            Report(WorkflowStage.SelfUpdateCheck, WorkflowStageStatus.Failed,
+                $"Updater self-update failed: {ex.Message}");
+            TryDeleteTemp(tempRoot);
+            return SelfUpdateAction.NoUpdate;
+        }
+    }
+
+    private string BuildSelfUpdateArgs(string originalExePath)
+    {
+        var parts = new List<string>();
+
+        // Mode
+        parts.Add(options.Mode.ToString().ToLowerInvariant());
+
+        // Core args
+        if (!string.IsNullOrWhiteSpace(options.ServerUrl))
+            parts.Add($"--server-url \"{options.ServerUrl}\"");
+        if (!string.IsNullOrWhiteSpace(options.AppDirectory))
+            parts.Add($"--app-dir \"{options.AppDirectory}\"");
+        if (!string.IsNullOrWhiteSpace(options.EntryExeOverride))
+            parts.Add($"--entry-exe \"{options.EntryExeOverride}\"");
+        if (!string.IsNullOrWhiteSpace(options.ApiKeyOverride))
+            parts.Add($"--api-key \"{options.ApiKeyOverride}\"");
+        if (!string.IsNullOrWhiteSpace(options.GrpcAddressOverride))
+            parts.Add($"--grpc-address \"{options.GrpcAddressOverride}\"");
+        if (options.NoLaunch)
+            parts.Add("--no-launch");
+        if (options.AssumeYes)
+            parts.Add("--yes");
+
+        // Self-update continuation flag
+        parts.Add($"--self-update-from \"{originalExePath}\"");
+
+        return string.Join(' ', parts);
     }
 
     private async Task<WorkflowResult> FinishAsync(
@@ -1033,6 +1223,16 @@ internal sealed class RemoteManifest
     public string? EntryExe { get; set; }
     public string? ProcessName { get; set; }
     public string? UpdaterPlanUrl { get; set; }
+    public string? UpdaterManifestUrl { get; set; }
+    public DateTimeOffset? PublishedAtUtc { get; set; }
+}
+
+internal sealed class RemoteUpdaterManifest
+{
+    public string Version { get; set; } = string.Empty;
+    public string PackageUrl { get; set; } = string.Empty;
+    public string Sha256 { get; set; } = string.Empty;
+    public string? EntryExe { get; set; }
     public DateTimeOffset? PublishedAtUtc { get; set; }
 }
 

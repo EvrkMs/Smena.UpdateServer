@@ -20,11 +20,13 @@ var options = app.Services.GetRequiredService<IOptions<UpdateServerOptions>>().V
 var jsonOptions = BuildJsonOptions();
 var updatesRoot = ResolvePath(options.UpdatesPath, app.Environment.ContentRootPath);
 var publishedClientRoot = ResolvePath(options.PublishedClientPath, app.Environment.ContentRootPath);
+var publishedUpdaterRoot = ResolvePath(options.PublishedUpdaterPath, app.Environment.ContentRootPath);
 var updaterPlanPath = Path.Combine(updatesRoot, options.UpdaterPlanFileName);
 
 Directory.CreateDirectory(updatesRoot);
 Directory.CreateDirectory(Path.Combine(updatesRoot, options.PackagesFolderName));
 Directory.CreateDirectory(publishedClientRoot);
+Directory.CreateDirectory(publishedUpdaterRoot);
 
 try
 {
@@ -55,6 +57,26 @@ if (options.RebuildOnStartup)
     catch (Exception ex)
     {
         logger.LogError(ex, "Failed to build client update package.");
+    }
+
+    try
+    {
+        var updaterRebuilt = await BuildUpdaterUpdateAsync(
+            publishedUpdaterRoot,
+            updatesRoot,
+            options,
+            jsonOptions,
+            logger,
+            app.Lifetime.ApplicationStopping);
+
+        if (!updaterRebuilt)
+        {
+            logger.LogWarning("Updater package was not rebuilt because published updater folder is empty: {Path}", publishedUpdaterRoot);
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Failed to build updater update package.");
     }
 }
 
@@ -106,6 +128,27 @@ app.MapGet("/updater.plan.json", async () =>
     catch
     {
         return Results.Problem("Invalid updater plan JSON.", statusCode: StatusCodes.Status500InternalServerError);
+    }
+
+    return Results.Text(content, "application/json");
+});
+
+app.MapGet("/updater-manifest.json", async () =>
+{
+    var updaterManifestPath = Path.Combine(updatesRoot, options.UpdaterManifestFileName);
+    if (!File.Exists(updaterManifestPath))
+    {
+        return Results.NotFound(new { error = "updater_manifest_not_found" });
+    }
+
+    var content = await File.ReadAllTextAsync(updaterManifestPath);
+    try
+    {
+        using var _ = JsonDocument.Parse(content);
+    }
+    catch
+    {
+        return Results.Problem("Invalid updater manifest JSON.", statusCode: StatusCodes.Status500InternalServerError);
     }
 
     return Results.Text(content, "application/json");
@@ -190,6 +233,7 @@ static async Task<bool> BuildClientUpdateAsync(
         EntryExe = options.EntryExe,
         ProcessName = options.ProcessName,
         UpdaterPlanUrl = $"/{options.UpdaterPlanFileName}",
+        UpdaterManifestUrl = $"/{options.UpdaterManifestFileName}",
         PublishedAtUtc = DateTimeOffset.UtcNow
     };
 
@@ -202,6 +246,71 @@ static async Task<bool> BuildClientUpdateAsync(
     logger.LogInformation(
         "Client update package built. Version: {Version}; Package: {Package}",
         manifest.Version,
+        packagePath);
+
+    return true;
+}
+
+static async Task<bool> BuildUpdaterUpdateAsync(
+    string publishedUpdaterRoot,
+    string updatesRoot,
+    UpdateServerOptions options,
+    JsonSerializerOptions jsonOptions,
+    ILogger logger,
+    CancellationToken ct)
+{
+    var files = Directory.GetFiles(publishedUpdaterRoot, "*", SearchOption.AllDirectories)
+        .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    if (files.Count == 0)
+    {
+        return false;
+    }
+
+    var version = await ComputeDirectoryHashAsync(publishedUpdaterRoot, files, ct);
+    var packagesRoot = Path.Combine(updatesRoot, options.PackagesFolderName);
+    var packageFileName = $"{options.UpdaterPackagePrefix}-{version}.zip";
+    var packagePath = Path.Combine(packagesRoot, packageFileName);
+
+    foreach (var existing in Directory.GetFiles(packagesRoot, $"{options.UpdaterPackagePrefix}-*.zip", SearchOption.TopDirectoryOnly))
+    {
+        if (!string.Equals(existing, packagePath, StringComparison.OrdinalIgnoreCase))
+        {
+            File.Delete(existing);
+        }
+    }
+
+    if (File.Exists(packagePath))
+    {
+        File.Delete(packagePath);
+    }
+
+    ZipFile.CreateFromDirectory(
+        publishedUpdaterRoot,
+        packagePath,
+        CompressionLevel.Optimal,
+        includeBaseDirectory: false);
+
+    var zipSha = await ComputeFileHashAsync(packagePath, ct);
+    var updaterManifest = new UpdaterUpdateManifest
+    {
+        Version = version,
+        PackageUrl = $"/updates/client/{options.PackagesFolderName}/{packageFileName}",
+        Sha256 = zipSha,
+        EntryExe = options.UpdaterEntryExe,
+        PublishedAtUtc = DateTimeOffset.UtcNow
+    };
+
+    var updaterManifestPath = Path.Combine(updatesRoot, options.UpdaterManifestFileName);
+    await File.WriteAllTextAsync(
+        updaterManifestPath,
+        JsonSerializer.Serialize(updaterManifest, jsonOptions),
+        ct);
+
+    logger.LogInformation(
+        "Updater package built. Version: {Version}; Package: {Package}",
+        updaterManifest.Version,
         packagePath);
 
     return true;
@@ -309,12 +418,16 @@ internal sealed class UpdateServerOptions
 
     public string UpdatesPath { get; set; } = "updates/client";
     public string PublishedClientPath { get; set; } = "updates/published-client";
+    public string PublishedUpdaterPath { get; set; } = "updates/published-updater";
     public string ManifestFileName { get; set; } = "manifest.json";
+    public string UpdaterManifestFileName { get; set; } = "updater-manifest.json";
     public string UpdaterPlanFileName { get; set; } = "updater.plan.json";
     public string PackagesFolderName { get; set; } = "packages";
     public string PackagePrefix { get; set; } = "client";
+    public string UpdaterPackagePrefix { get; set; } = "updater";
     public string EntryExe { get; set; } = "Smena.Client.exe";
     public string ProcessName { get; set; } = "Smena.Client";
+    public string UpdaterEntryExe { get; set; } = "Smena.Updater.exe";
     public string AppDirPolicy { get; set; } = "relativeToUpdater";
     public string AppDirRelativePath { get; set; } = "client";
     public bool CreateAppDirIfMissing { get; set; } = true;
@@ -341,6 +454,27 @@ internal sealed class ClientUpdateManifest
 
     [JsonPropertyName("updaterPlanUrl")]
     public string UpdaterPlanUrl { get; set; } = string.Empty;
+
+    [JsonPropertyName("updaterManifestUrl")]
+    public string UpdaterManifestUrl { get; set; } = string.Empty;
+
+    [JsonPropertyName("publishedAtUtc")]
+    public DateTimeOffset PublishedAtUtc { get; set; }
+}
+
+internal sealed class UpdaterUpdateManifest
+{
+    [JsonPropertyName("version")]
+    public string Version { get; set; } = string.Empty;
+
+    [JsonPropertyName("packageUrl")]
+    public string PackageUrl { get; set; } = string.Empty;
+
+    [JsonPropertyName("sha256")]
+    public string Sha256 { get; set; } = string.Empty;
+
+    [JsonPropertyName("entryExe")]
+    public string EntryExe { get; set; } = string.Empty;
 
     [JsonPropertyName("publishedAtUtc")]
     public DateTimeOffset PublishedAtUtc { get; set; }

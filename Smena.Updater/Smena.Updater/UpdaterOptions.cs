@@ -17,6 +17,11 @@ internal sealed class UpdaterOptions
     public string? GrpcAddressOverride { get; init; }
     public bool NoLaunch { get; init; }
     public bool AssumeYes { get; init; }
+    /// <summary>
+    /// When set, this is a self-update continuation: the updater was launched from a temp
+    /// directory and should copy itself over the original at this path before proceeding.
+    /// </summary>
+    public string? SelfUpdateFromPath { get; init; }
 
     public static string Usage =>
         """
@@ -43,6 +48,7 @@ internal sealed class UpdaterOptions
         var apiKeyOverride = argsMap.GetValueOrDefault("api-key");
         var assumeYes = argsMap.ContainsKey("yes");
         var noLaunch = argsMap.ContainsKey("no-launch");
+        var selfUpdateFromPath = argsMap.GetValueOrDefault("self-update-from")?.Trim();
 
         var grpcAddressArg = argsMap.GetValueOrDefault("grpc-address");
         string? grpcAddressOverride = null;
@@ -83,7 +89,8 @@ internal sealed class UpdaterOptions
                 ApiKeyOverride = apiKeyOverride,
                 GrpcAddressOverride = grpcAddressOverride,
                 NoLaunch = noLaunch,
-                AssumeYes = assumeYes
+                AssumeYes = assumeYes,
+                SelfUpdateFromPath = selfUpdateFromPath
             };
             errorMessage = string.Empty;
             return true;
@@ -100,7 +107,8 @@ internal sealed class UpdaterOptions
                 ApiKeyOverride = apiKeyOverride,
                 GrpcAddressOverride = grpcAddressOverride,
                 NoLaunch = noLaunch,
-                AssumeYes = assumeYes
+                AssumeYes = assumeYes,
+                SelfUpdateFromPath = selfUpdateFromPath
             };
             errorMessage = string.Empty;
             return true;
@@ -122,7 +130,8 @@ internal sealed class UpdaterOptions
             ApiKeyOverride = apiKeyOverride,
             GrpcAddressOverride = grpcAddressOverride,
             NoLaunch = true,
-            AssumeYes = assumeYes
+            AssumeYes = assumeYes,
+            SelfUpdateFromPath = selfUpdateFromPath
         };
 
         errorMessage = string.Empty;
