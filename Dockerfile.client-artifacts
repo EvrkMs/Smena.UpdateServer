@@ -1,0 +1,50 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS client-build
+WORKDIR /src
+
+ARG PRIMARY_DOMAIN=localhost
+ARG GRPC_PORT=5001
+ARG API_KEY=
+ARG ENTRY_EXE=Smena.Client.exe
+ARG PROCESS_NAME=Smena.Client
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends zip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ./Smena.Client ./Smena.Client
+RUN dotnet restore Smena.Client/Smena.Client/Smena.Client.csproj
+RUN dotnet publish Smena.Client/Smena.Client/Smena.Client.csproj -c Release -r win-x64 --self-contained false -p:UseAppHost=true -o /artifacts/published-client
+RUN printf '{\n  "Grpc": {\n    "Address": "https://%s:%s",\n    "ApiKey": "%s"\n  }\n}\n' \
+    "$PRIMARY_DOMAIN" \
+    "$GRPC_PORT" \
+    "$API_KEY" \
+    > /artifacts/published-client/appsettings.json
+RUN mkdir -p /artifacts/wwwroot/updates/client/packages
+RUN cd /artifacts/published-client && zip -qr /artifacts/wwwroot/updates/client/packages/client.zip .
+RUN find /artifacts/published-client -type f -printf '%P\n' \
+    | LC_ALL=C sort \
+    | while read -r relative; do \
+        file_hash="$(sha256sum "/artifacts/published-client/$relative" | cut -d' ' -f1)"; \
+        printf '%s|%s\n' "$relative" "$file_hash"; \
+      done \
+    | sha256sum \
+    | cut -d' ' -f1 \
+    > /artifacts/version.txt
+RUN sha256sum /artifacts/wwwroot/updates/client/packages/client.zip | cut -d' ' -f1 > /artifacts/package.sha256
+RUN version="$(cat /artifacts/version.txt)" \
+    && package_sha="$(cat /artifacts/package.sha256)" \
+    && published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    && package_name="client-${version}.zip" \
+    && mv /artifacts/wwwroot/updates/client/packages/client.zip "/artifacts/wwwroot/updates/client/packages/${package_name}" \
+    && printf '{\n  "version": "%s",\n  "packageUrl": "/updates/client/packages/%s",\n  "sha256": "%s",\n  "entryExe": "%s",\n  "processName": "%s",\n  "updaterPlanUrl": "/updater.plan.json",\n  "updaterManifestUrl": "/updater-manifest.json",\n  "publishedAtUtc": "%s"\n}\n' \
+      "$version" \
+      "$package_name" \
+      "$package_sha" \
+      "$ENTRY_EXE" \
+      "$PROCESS_NAME" \
+      "$published_at" \
+      > /artifacts/wwwroot/manifest.json
+
+FROM nginx:1.27-alpine AS final
+COPY --from=client-build /artifacts/wwwroot /usr/share/nginx/html
+EXPOSE 80

@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Options;
+using System.Net.Http.Headers;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -12,6 +13,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<UpdateServerOptions>(
     builder.Configuration.GetSection(UpdateServerOptions.SectionName));
 builder.Services.AddHealthChecks();
+builder.Services.AddHttpClient("client-artifacts");
 
 var app = builder.Build();
 var logger = app.Logger;
@@ -24,6 +26,8 @@ var publishedUpdaterRoot = ResolvePath(options.PublishedUpdaterPath, app.Environ
 var updaterPlanPath = Path.Combine(updatesRoot, options.UpdaterPlanFileName);
 var updateServerApiKey = options.ApiKey?.Trim();
 var updaterDownloadPath = NormalizeRoutePath(options.UpdaterDownloadPath);
+var clientArtifactsBaseUri = TryCreateAbsoluteUri(options.ClientArtifactsBaseUrl);
+var proxyClientArtifacts = clientArtifactsBaseUri is not null;
 
 Directory.CreateDirectory(updatesRoot);
 Directory.CreateDirectory(Path.Combine(updatesRoot, options.PackagesFolderName));
@@ -39,7 +43,7 @@ catch (Exception ex)
     logger.LogError(ex, "Failed to build updater plan.");
 }
 
-if (options.RebuildOnStartup)
+if (options.RebuildOnStartup && !proxyClientArtifacts)
 {
     try
     {
@@ -81,6 +85,10 @@ if (options.RebuildOnStartup)
         logger.LogError(ex, "Failed to build updater update package.");
     }
 }
+else if (proxyClientArtifacts)
+{
+    logger.LogInformation("Client artifacts proxy enabled. Remote source: {ClientArtifactsBaseUrl}", clientArtifactsBaseUri);
+}
 
 if (!string.IsNullOrWhiteSpace(updateServerApiKey))
 {
@@ -111,30 +119,42 @@ app.MapGet("/", () => Results.Json(new
     status = "ok",
     publishedClientPath = publishedClientRoot,
     updatesPath = updatesRoot,
+    clientArtifactsMode = proxyClientArtifacts ? "proxy" : "local",
     manifest = "/manifest.json",
     updaterPlan = "/updater.plan.json",
     updaterBinary = updaterDownloadPath
 }));
 
-app.MapGet("/manifest.json", async () =>
+app.MapGet("/manifest.json", async (HttpContext context, IHttpClientFactory httpClientFactory, CancellationToken ct) =>
 {
+    if (clientArtifactsBaseUri is not null)
+    {
+        await ProxyResponseAsync(context, httpClientFactory, clientArtifactsBaseUri, "/manifest.json", ct);
+        return;
+    }
+
     var manifestPath = Path.Combine(updatesRoot, options.ManifestFileName);
     if (!File.Exists(manifestPath))
     {
-        return Results.NotFound(new { error = "manifest_not_found" });
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        await context.Response.WriteAsJsonAsync(new { error = "manifest_not_found" }, ct);
+        return;
     }
 
-    var content = await File.ReadAllTextAsync(manifestPath);
+    var content = await File.ReadAllTextAsync(manifestPath, ct);
     try
     {
         using var _ = JsonDocument.Parse(content);
     }
     catch
     {
-        return Results.Problem("Invalid manifest JSON.", statusCode: StatusCodes.Status500InternalServerError);
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        await context.Response.WriteAsync("Invalid manifest JSON.", ct);
+        return;
     }
 
-    return Results.Text(content, "application/json");
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync(content, ct);
 });
 
 app.MapGet("/updater.plan.json", async () =>
@@ -192,13 +212,23 @@ app.MapGet(updaterDownloadPath, () =>
         fileDownloadName: options.UpdaterEntryExe);
 });
 
-// Serve update artifacts from /updates/client/*
-app.UseStaticFiles(new StaticFileOptions
+if (proxyClientArtifacts)
 {
-    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(updatesRoot),
-    RequestPath = "/updates/client",
-    ContentTypeProvider = BuildContentTypeProvider()
-});
+    app.Map("/updates/client/{**path}", async (HttpContext context, IHttpClientFactory httpClientFactory, CancellationToken ct) =>
+    {
+        await ProxyResponseAsync(context, httpClientFactory, clientArtifactsBaseUri!, context.Request.Path, ct);
+    });
+}
+else
+{
+    // Serve update artifacts from /updates/client/*
+    app.UseStaticFiles(new StaticFileOptions
+    {
+        FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(updatesRoot),
+        RequestPath = "/updates/client",
+        ContentTypeProvider = BuildContentTypeProvider()
+    });
+}
 
 app.Run();
 
@@ -210,6 +240,18 @@ static string ResolvePath(string configuredPath, string contentRoot)
     }
 
     return Path.GetFullPath(Path.Combine(contentRoot, configuredPath));
+}
+
+static Uri? TryCreateAbsoluteUri(string? configuredUrl)
+{
+    if (string.IsNullOrWhiteSpace(configuredUrl))
+    {
+        return null;
+    }
+
+    return Uri.TryCreate(configuredUrl.Trim(), UriKind.Absolute, out var absoluteUri)
+        ? absoluteUri
+        : null;
 }
 
 static bool IsProtectedUpdateRequest(PathString path, string updaterDownloadPath)
@@ -251,6 +293,50 @@ static FileExtensionContentTypeProvider BuildContentTypeProvider()
     provider.Mappings[".sha256"] = "text/plain";
     provider.Mappings[".zip"] = "application/zip";
     return provider;
+}
+
+static async Task ProxyResponseAsync(
+    HttpContext context,
+    IHttpClientFactory httpClientFactory,
+    Uri baseUri,
+    PathString requestPath,
+    CancellationToken ct)
+{
+    var targetUri = BuildProxyUri(baseUri, requestPath, context.Request.QueryString);
+    using var request = new HttpRequestMessage(HttpMethod.Get, targetUri);
+    using var response = await httpClientFactory
+        .CreateClient("client-artifacts")
+        .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+
+    context.Response.StatusCode = (int)response.StatusCode;
+
+    foreach (var header in response.Headers)
+    {
+        context.Response.Headers[header.Key] = header.Value.ToArray();
+    }
+
+    foreach (var header in response.Content.Headers)
+    {
+        context.Response.Headers[header.Key] = header.Value.ToArray();
+    }
+
+    context.Response.Headers.Remove("transfer-encoding");
+
+    if (response.Content.Headers.ContentType is MediaTypeHeaderValue contentType)
+    {
+        context.Response.ContentType = contentType.ToString();
+    }
+
+    await using var stream = await response.Content.ReadAsStreamAsync(ct);
+    await stream.CopyToAsync(context.Response.Body, ct);
+}
+
+static Uri BuildProxyUri(Uri baseUri, PathString requestPath, QueryString queryString)
+{
+    var path = requestPath.HasValue ? requestPath.Value! : "/";
+    var relativePath = path.StartsWith('/') ? path[1..] : path;
+    var relativeWithQuery = string.Concat(relativePath, queryString.HasValue ? queryString.Value : string.Empty);
+    return new Uri(baseUri, relativeWithQuery);
 }
 
 static async Task<bool> BuildClientUpdateAsync(
@@ -482,6 +568,7 @@ internal sealed class UpdateServerOptions
     public string ProcessName { get; set; } = "Smena.Client";
     public string UpdaterEntryExe { get; set; } = "Smena.Updater.exe";
     public string UpdaterDownloadPath { get; set; } = "/updater/Smena.Updater.exe";
+    public string? ClientArtifactsBaseUrl { get; set; }
     public string? ApiKey { get; set; }
     public string AppDirPolicy { get; set; } = "relativeToUpdater";
     public string AppDirRelativePath { get; set; } = "client";
