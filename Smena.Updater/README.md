@@ -5,7 +5,7 @@ Standalone updater executable for `Smena.Client`.
 ## Usage
 
 ```powershell
-Smena.Updater.exe update --server-url https://smena.ava-kk.ru:5100 --app-dir "C:\Apps\SmenaClient" --grpc-address https://smena.ava-kk.ru:5001
+Smena.Updater.exe update --server-url https://smena.ava-kk.ru:5100 --api-key <update-server-key> --app-dir "C:\Apps\SmenaClient"
 Smena.Updater.exe reconfig
 Smena.Updater.exe uninstall --app-dir "C:\Apps\SmenaClient"
 ```
@@ -13,18 +13,17 @@ Smena.Updater.exe uninstall --app-dir "C:\Apps\SmenaClient"
 Optional args:
 
 - `--entry-exe Smena.Client.exe`
-- `--api-key <key>`
-- `--grpc-address <url>`
+- `--api-key <key>` - API key for access to `Smena.UpdateServer`
 - `--no-launch` (apply update but do not start client)
 - `--yes` (for uninstall without confirmation dialog)
 
 Modes:
 
 1. `update` - default update flow (manifest, package download, apply, launch).
-2. `reconfig` - update only saved `AVA_SMENA_API_KEY` and `AVA_SMENA_GRPC_ADDRESS`.
+2. `reconfig` - reserved lightweight mode without server/package actions.
 3. `uninstall` - stop client, remove app directory, clear saved env vars.
 
-`update` mode can work without `--app-dir`: updater reads `updater.plan.json` and resolves app directory by plan policy (default `relativeToUpdater/client`).
+`update` mode can work without `--app-dir`: updater reads `updater.plan.json` and resolves app directory by plan policy (default `relativeToUpdater/clients`).
 
 You can also use executable aliases instead of explicit mode:
 
@@ -41,9 +40,6 @@ Updater now runs as a small WinForms app with visible stages:
 6. Replace files in app directory
 7. Write new `update.local.json`
 8. Start client (unless `--no-launch`)
-
-If `AVA_SMENA_API_KEY` is missing, updater asks for it once and saves it to user environment variables.
-If `AVA_SMENA_GRPC_ADDRESS` is missing, updater asks for it once and saves it to user environment variables.
 
 When `manifest.json` includes `updaterPlanUrl`, updater downloads `updater.plan.json` and applies:
 

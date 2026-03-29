@@ -14,7 +14,6 @@ internal sealed class UpdaterOptions
     public string AppDirectory { get; init; } = string.Empty;
     public string? EntryExeOverride { get; init; }
     public string? ApiKeyOverride { get; init; }
-    public string? GrpcAddressOverride { get; init; }
     public bool NoLaunch { get; init; }
     public bool AssumeYes { get; init; }
     /// <summary>
@@ -26,8 +25,8 @@ internal sealed class UpdaterOptions
     public static string Usage =>
         """
         Usage:
-          Smena.Updater.exe [update] --server-url <url> [--app-dir <path>] [--entry-exe Smena.Client.exe] [--api-key <key>] [--grpc-address <url>] [--no-launch]
-          Smena.Updater.exe reconfig [--api-key <key>] [--grpc-address <url>]
+          Smena.Updater.exe [update] --server-url <url> [--app-dir <path>] [--entry-exe Smena.Client.exe] [--api-key <key>] [--no-launch]
+          Smena.Updater.exe reconfig
           Smena.Updater.exe uninstall --app-dir <path> [--entry-exe Smena.Client.exe] [--yes]
 
         Notes:
@@ -50,20 +49,6 @@ internal sealed class UpdaterOptions
         var assumeYes = argsMap.ContainsKey("yes");
         var noLaunch = argsMap.ContainsKey("no-launch");
         var selfUpdateFromPath = argsMap.GetValueOrDefault("self-update-from")?.Trim();
-
-        var grpcAddressArg = argsMap.GetValueOrDefault("grpc-address");
-        string? grpcAddressOverride = null;
-        if (!string.IsNullOrWhiteSpace(grpcAddressArg))
-        {
-            if (!TryNormalizeGrpcAddress(grpcAddressArg, out var normalizedGrpcAddress, out var grpcError))
-            {
-                options = new UpdaterOptions();
-                errorMessage = grpcError;
-                return false;
-            }
-
-            grpcAddressOverride = normalizedGrpcAddress;
-        }
 
         if (mode == UpdaterMode.Update)
         {
@@ -88,7 +73,6 @@ internal sealed class UpdaterOptions
                 AppDirectory = appDirectory,
                 EntryExeOverride = entryExeOverride,
                 ApiKeyOverride = apiKeyOverride,
-                GrpcAddressOverride = grpcAddressOverride,
                 NoLaunch = noLaunch,
                 AssumeYes = assumeYes,
                 SelfUpdateFromPath = selfUpdateFromPath
@@ -106,7 +90,6 @@ internal sealed class UpdaterOptions
                 AppDirectory = appDirectory,
                 EntryExeOverride = entryExeOverride,
                 ApiKeyOverride = apiKeyOverride,
-                GrpcAddressOverride = grpcAddressOverride,
                 NoLaunch = noLaunch,
                 AssumeYes = assumeYes,
                 SelfUpdateFromPath = selfUpdateFromPath
@@ -129,7 +112,6 @@ internal sealed class UpdaterOptions
             AppDirectory = appDirectory,
             EntryExeOverride = entryExeOverride,
             ApiKeyOverride = apiKeyOverride,
-            GrpcAddressOverride = grpcAddressOverride,
             NoLaunch = true,
             AssumeYes = assumeYes,
             SelfUpdateFromPath = selfUpdateFromPath
@@ -215,25 +197,6 @@ internal sealed class UpdaterOptions
         if (!string.Equals(new Uri(normalizedServerUrl).Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
         {
             error = $"--server-url must use HTTPS. Received: {rawServerUrl?.Trim()}";
-            return false;
-        }
-
-        return true;
-    }
-
-    public static bool TryNormalizeGrpcAddress(string? rawGrpcAddress, out string normalizedGrpcAddress, out string error)
-    {
-        var parsed = TryNormalizeUrl(rawGrpcAddress, out normalizedGrpcAddress, out error);
-        if (!parsed)
-        {
-            return false;
-        }
-
-        var scheme = new Uri(normalizedGrpcAddress).Scheme;
-        if (!string.Equals(scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
-        {
-            error = $"--grpc-address must use HTTP or HTTPS. Received: {rawGrpcAddress?.Trim()}";
             return false;
         }
 

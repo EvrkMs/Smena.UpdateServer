@@ -7,6 +7,7 @@ Minimal standalone server for client updates.
 - `GET /healthz`
 - `GET /manifest.json`
 - `GET /updater.plan.json`
+- `GET /updater/Smena.Updater.exe`
 - `GET /updates/client/*` (static files, including packages)
 
 ## Configuration
@@ -34,6 +35,8 @@ Override with env vars:
 - `UpdateServer__UpdaterPlanFileName`
 - `UpdateServer__EntryExe`
 - `UpdateServer__ProcessName`
+- `UpdateServer__UpdaterDownloadPath`
+- `UpdateServer__ApiKey`
 
 ## Docker
 
@@ -49,6 +52,8 @@ During image build:
 
 1. `Smena.Client` is published into `updates/published-client`.
 2. `Smena.UpdateServer` is published as the runtime service.
+
+If `UpdateServer__ApiKey` is set, requests to `/healthz`, `/manifest.json`, `/updater.plan.json`, `/updater-manifest.json`, and `/updates/client/*` must include header `x-api-key`. The updater binary endpoint stays public so anyone can download `Smena.Updater.exe`.
 
 ## Publish flow
 

@@ -143,6 +143,11 @@ internal sealed class UpdaterWorkflow
             Timeout = TimeSpan.FromSeconds(30)
         };
 
+        if (!string.IsNullOrWhiteSpace(options.ApiKeyOverride))
+        {
+            http.DefaultRequestHeaders.Add("x-api-key", options.ApiKeyOverride);
+        }
+
         // ── Self-update logic ──────────────────────────────────────
         if (!string.IsNullOrWhiteSpace(options.SelfUpdateFromPath))
         {
@@ -246,7 +251,7 @@ internal sealed class UpdaterWorkflow
             SkipStage(WorkflowStage.FetchUpdaterPlan, "Manifest does not include updaterPlanUrl.");
         }
 
-        var appDirFullPath = ResolveAppDirectory(options.AppDirectory, updaterPlan?.App);
+        var appDirFullPath = ResolveAppDirectory(options, updaterPlan?.App);
         var createAppDirIfMissing = updaterPlan?.App?.CreateAppDirIfMissing ?? false;
         Report(WorkflowStage.ValidateInput, WorkflowStageStatus.Running, "Validating startup options.");
         if (!Directory.Exists(appDirFullPath))
@@ -266,50 +271,23 @@ internal sealed class UpdaterWorkflow
         var entryExe = ResolveEntryExe(options, remoteManifest, updaterPlan);
         var processName = ResolveProcessName(remoteManifest, updaterPlan, entryExe);
 
-        string? apiKey;
-        string? grpcAddress;
         if (updaterPlan is { Env.Count: > 0 })
         {
             Report(WorkflowStage.EnsureApiKey, WorkflowStageStatus.Running, "Applying updater plan environment.");
             Report(WorkflowStage.EnsureGrpcAddress, WorkflowStageStatus.Running, "Applying updater plan environment.");
-            Dictionary<string, string> resolvedEnv;
             try
             {
-                resolvedEnv = await EnsurePlanEnvironmentAsync(updaterPlan.Env, cancellationToken);
+                await EnsurePlanEnvironmentAsync(updaterPlan.Env, cancellationToken);
             }
             catch (Exception ex)
             {
                 return Fail(WorkflowStage.EnsureApiKey, 10, $"Failed to apply updater plan environment: {ex.Message}");
             }
-            if (!resolvedEnv.TryGetValue("AVA_SMENA_API_KEY", out apiKey) || string.IsNullOrWhiteSpace(apiKey))
-            {
-                return Fail(WorkflowStage.EnsureApiKey, 10, "API key not provided. Update canceled.");
-            }
-
-            if (!resolvedEnv.TryGetValue("AVA_SMENA_GRPC_ADDRESS", out grpcAddress) || string.IsNullOrWhiteSpace(grpcAddress))
-            {
-                return Fail(WorkflowStage.EnsureGrpcAddress, 11, "gRPC address not provided. Update canceled.");
-            }
         }
         else
         {
-            Report(WorkflowStage.EnsureApiKey, WorkflowStageStatus.Running, "Checking AVA_SMENA_API_KEY.");
-            apiKey = await EnsureApiKeyAsync(cancellationToken);
-            if (apiKey == null)
-            {
-                return Fail(WorkflowStage.EnsureApiKey, 10, "API key not provided. Update canceled.");
-            }
-
-            Report(WorkflowStage.EnsureApiKey, WorkflowStageStatus.Success, "API key is ready.");
-
-            Report(WorkflowStage.EnsureGrpcAddress, WorkflowStageStatus.Running, "Checking client gRPC address.");
-            grpcAddress = await EnsureGrpcAddressAsync(cancellationToken);
-            if (grpcAddress == null)
-            {
-                return Fail(WorkflowStage.EnsureGrpcAddress, 11, "gRPC address not provided. Update canceled.");
-            }
-
-            Report(WorkflowStage.EnsureGrpcAddress, WorkflowStageStatus.Success, $"gRPC address is ready: {grpcAddress}");
+            SkipStage(WorkflowStage.EnsureApiKey, "API key is bundled with the client appsettings.");
+            SkipStage(WorkflowStage.EnsureGrpcAddress, "gRPC address is bundled with the client appsettings.");
         }
 
         var localStatePath = Path.Combine(appDirFullPath, "update.local.json");
@@ -331,8 +309,6 @@ internal sealed class UpdaterWorkflow
             updated: false,
             appDirFullPath,
             entryExe,
-            apiKey,
-            grpcAddress,
             remoteManifest.Version);
         }
 
@@ -409,30 +385,14 @@ internal sealed class UpdaterWorkflow
             updated: true,
             appDirFullPath,
             entryExe,
-            apiKey!,
-            grpcAddress!,
             remoteManifest.Version);
     }
 
     private async Task<WorkflowResult> ExecuteReconfigureAsync(CancellationToken cancellationToken)
     {
-        Report(WorkflowStage.EnsureApiKey, WorkflowStageStatus.Running, "Checking AVA_SMENA_API_KEY.");
-        var apiKey = await EnsureApiKeyAsync(cancellationToken);
-        if (apiKey == null)
-        {
-            return Fail(WorkflowStage.EnsureApiKey, 10, "API key not provided. Reconfigure canceled.");
-        }
-
-        Report(WorkflowStage.EnsureApiKey, WorkflowStageStatus.Success, "API key is ready.");
-
-        Report(WorkflowStage.EnsureGrpcAddress, WorkflowStageStatus.Running, "Checking client gRPC address.");
-        var grpcAddress = await EnsureGrpcAddressAsync(cancellationToken);
-        if (grpcAddress == null)
-        {
-            return Fail(WorkflowStage.EnsureGrpcAddress, 11, "gRPC address not provided. Reconfigure canceled.");
-        }
-
-        Report(WorkflowStage.EnsureGrpcAddress, WorkflowStageStatus.Success, $"gRPC address is ready: {grpcAddress}");
+        cancellationToken.ThrowIfCancellationRequested();
+        SkipStage(WorkflowStage.EnsureApiKey, "API key is bundled with the client appsettings.");
+        SkipStage(WorkflowStage.EnsureGrpcAddress, "gRPC address is bundled with the client appsettings.");
 
         SkipStage(WorkflowStage.ConnectServer, "Server check is not required in reconfigure mode.");
         SkipStage(WorkflowStage.FetchManifest, "Manifest is not used in reconfigure mode.");
@@ -546,8 +506,7 @@ internal sealed class UpdaterWorkflow
         }
 
         // Compare local updater version from saved state
-        var updaterDir = Path.GetDirectoryName(Environment.ProcessPath ?? AppContext.BaseDirectory)
-            ?? AppContext.BaseDirectory;
+        var updaterDir = GetUpdaterBaseDirectory(options);
         var updaterStatePath = Path.Combine(updaterDir, "updater.local.json");
         var localUpdaterVersion = await TryReadLocalVersionAsync(updaterStatePath, cancellationToken);
 
@@ -655,8 +614,6 @@ internal sealed class UpdaterWorkflow
             parts.Add($"--entry-exe \"{options.EntryExeOverride}\"");
         // API key is passed via SMENA_UPDATER_API_KEY env var (set on ProcessStartInfo)
         // instead of command-line to avoid exposure in process listings.
-        if (!string.IsNullOrWhiteSpace(options.GrpcAddressOverride))
-            parts.Add($"--grpc-address \"{options.GrpcAddressOverride}\"");
         if (options.NoLaunch)
             parts.Add("--no-launch");
         if (options.AssumeYes)
@@ -672,8 +629,6 @@ internal sealed class UpdaterWorkflow
         bool updated,
         string appDirFullPath,
         string entryExe,
-        string apiKey,
-        string grpcAddress,
         string version)
     {
         if (options.NoLaunch)
@@ -686,7 +641,7 @@ internal sealed class UpdaterWorkflow
         }
 
         Report(WorkflowStage.LaunchClient, WorkflowStageStatus.Running, "Starting client.");
-        var launchCode = LaunchClient(appDirFullPath, entryExe, apiKey, grpcAddress);
+        var launchCode = LaunchClient(appDirFullPath, entryExe);
         if (launchCode != 0)
         {
             return Fail(WorkflowStage.LaunchClient, launchCode, "Failed to launch client.");
@@ -727,43 +682,6 @@ internal sealed class UpdaterWorkflow
 
         SaveApiKey(entered);
         return entered;
-    }
-
-    private async Task<string?> EnsureGrpcAddressAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (!string.IsNullOrWhiteSpace(options.GrpcAddressOverride))
-        {
-            SaveGrpcAddress(options.GrpcAddressOverride);
-            return options.GrpcAddressOverride;
-        }
-
-        var existing =
-            Environment.GetEnvironmentVariable("AVA_SMENA_GRPC_ADDRESS", EnvironmentVariableTarget.Process) ??
-            Environment.GetEnvironmentVariable("AVA_SMENA_GRPC_ADDRESS", EnvironmentVariableTarget.User) ??
-            Environment.GetEnvironmentVariable("AVA_SMENA_GRPC_ADDRESS") ??
-            Environment.GetEnvironmentVariable("Grpc__Address");
-
-        if (!string.IsNullOrWhiteSpace(existing) &&
-            UpdaterOptions.TryNormalizeGrpcAddress(existing, out var normalizedExisting, out _))
-        {
-            return normalizedExisting;
-        }
-
-        var entered = await interaction.PromptGrpcAddressAsync();
-        if (string.IsNullOrWhiteSpace(entered))
-        {
-            return null;
-        }
-
-        if (!UpdaterOptions.TryNormalizeGrpcAddress(entered, out var normalizedEntered, out _))
-        {
-            return null;
-        }
-
-        SaveGrpcAddress(normalizedEntered);
-        return normalizedEntered;
     }
 
     private async Task<Dictionary<string, string>> EnsurePlanEnvironmentAsync(
@@ -1087,25 +1005,39 @@ internal sealed class UpdaterWorkflow
         return new Uri($"{serverUrl.TrimEnd('/')}/{updaterPlanUrl.TrimStart('/')}");
     }
 
-    private static string ResolveAppDirectory(string cliAppDirectory, UpdaterPlanApp? appPlan)
+    private static string ResolveAppDirectory(UpdaterOptions options, UpdaterPlanApp? appPlan)
     {
-        if (!string.IsNullOrWhiteSpace(cliAppDirectory))
+        if (!string.IsNullOrWhiteSpace(options.AppDirectory))
         {
-            return Path.GetFullPath(cliAppDirectory);
+            return Path.GetFullPath(options.AppDirectory);
         }
 
         var policy = appPlan?.AppDirPolicy?.Trim();
         if (string.Equals(policy, "relativeToUpdater", StringComparison.OrdinalIgnoreCase))
         {
-            var updaterBaseDir = Path.GetDirectoryName(Environment.ProcessPath ?? AppContext.BaseDirectory)
-                ?? AppContext.BaseDirectory;
+            var updaterBaseDir = GetUpdaterBaseDirectory(options);
             var relativePath = string.IsNullOrWhiteSpace(appPlan?.AppDirRelativePath)
-                ? "client"
+                ? "clients"
                 : appPlan.AppDirRelativePath!.Trim();
             return Path.GetFullPath(Path.Combine(updaterBaseDir, relativePath));
         }
 
-        return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "client"));
+        return Path.GetFullPath(Path.Combine(GetUpdaterBaseDirectory(options), "clients"));
+    }
+
+    private static string GetUpdaterBaseDirectory(UpdaterOptions options)
+    {
+        if (!string.IsNullOrWhiteSpace(options.SelfUpdateFromPath))
+        {
+            var originalUpdaterDirectory = Path.GetDirectoryName(options.SelfUpdateFromPath);
+            if (!string.IsNullOrWhiteSpace(originalUpdaterDirectory))
+            {
+                return Path.GetFullPath(originalUpdaterDirectory);
+            }
+        }
+
+        var currentUpdaterDirectory = Path.GetDirectoryName(Environment.ProcessPath ?? AppContext.BaseDirectory);
+        return Path.GetFullPath(currentUpdaterDirectory ?? AppContext.BaseDirectory);
     }
 
     private static string ResolveEntryExe(UpdaterOptions updaterOptions, RemoteManifest manifest, UpdaterPlan? plan)
@@ -1143,7 +1075,7 @@ internal sealed class UpdaterWorkflow
         return Path.GetFileNameWithoutExtension(entryExe) ?? "Smena.Client";
     }
 
-    private static int LaunchClient(string appDirFullPath, string entryExe, string apiKey, string grpcAddress)
+    private static int LaunchClient(string appDirFullPath, string entryExe)
     {
         var exePath = Path.Combine(appDirFullPath, entryExe);
         if (!File.Exists(exePath))
@@ -1160,17 +1092,6 @@ internal sealed class UpdaterWorkflow
                 UseShellExecute = false
             };
 
-            if (!string.IsNullOrWhiteSpace(apiKey))
-            {
-                startInfo.Environment["AVA_SMENA_API_KEY"] = apiKey;
-            }
-
-            if (!string.IsNullOrWhiteSpace(grpcAddress))
-            {
-                startInfo.Environment["AVA_SMENA_GRPC_ADDRESS"] = grpcAddress;
-                startInfo.Environment["Grpc__Address"] = grpcAddress;
-            }
-
             Process.Start(startInfo);
             return 0;
         }
@@ -1185,12 +1106,6 @@ internal sealed class UpdaterWorkflow
         SaveEnvironmentVariable("AVA_SMENA_API_KEY", apiKey);
     }
 
-    private static void SaveGrpcAddress(string grpcAddress)
-    {
-        SaveEnvironmentVariable("AVA_SMENA_GRPC_ADDRESS", grpcAddress);
-        SaveEnvironmentVariable("Grpc__Address", grpcAddress);
-    }
-
     private static void SaveEnvironmentVariable(string name, string value)
     {
         Environment.SetEnvironmentVariable(name, value, EnvironmentVariableTarget.User);
@@ -1201,9 +1116,6 @@ internal sealed class UpdaterWorkflow
     {
         Environment.SetEnvironmentVariable("AVA_SMENA_API_KEY", null, EnvironmentVariableTarget.User);
         Environment.SetEnvironmentVariable("AVA_SMENA_API_KEY", null, EnvironmentVariableTarget.Process);
-        Environment.SetEnvironmentVariable("AVA_SMENA_GRPC_ADDRESS", null, EnvironmentVariableTarget.User);
-        Environment.SetEnvironmentVariable("AVA_SMENA_GRPC_ADDRESS", null, EnvironmentVariableTarget.Process);
-        Environment.SetEnvironmentVariable("Grpc__Address", null, EnvironmentVariableTarget.Process);
     }
 
     private static void TryDeleteTemp(string path)

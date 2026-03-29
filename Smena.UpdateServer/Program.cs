@@ -22,6 +22,8 @@ var updatesRoot = ResolvePath(options.UpdatesPath, app.Environment.ContentRootPa
 var publishedClientRoot = ResolvePath(options.PublishedClientPath, app.Environment.ContentRootPath);
 var publishedUpdaterRoot = ResolvePath(options.PublishedUpdaterPath, app.Environment.ContentRootPath);
 var updaterPlanPath = Path.Combine(updatesRoot, options.UpdaterPlanFileName);
+var updateServerApiKey = options.ApiKey?.Trim();
+var updaterDownloadPath = NormalizeRoutePath(options.UpdaterDownloadPath);
 
 Directory.CreateDirectory(updatesRoot);
 Directory.CreateDirectory(Path.Combine(updatesRoot, options.PackagesFolderName));
@@ -80,6 +82,27 @@ if (options.RebuildOnStartup)
     }
 }
 
+if (!string.IsNullOrWhiteSpace(updateServerApiKey))
+{
+    app.Use(async (context, next) =>
+    {
+        if (!IsProtectedUpdateRequest(context.Request.Path, updaterDownloadPath))
+        {
+            await next();
+            return;
+        }
+
+        if (!HasMatchingApiKey(context.Request.Headers["x-api-key"], updateServerApiKey))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new { error = "invalid_api_key" });
+            return;
+        }
+
+        await next();
+    });
+}
+
 app.MapHealthChecks("/healthz");
 
 app.MapGet("/", () => Results.Json(new
@@ -89,7 +112,8 @@ app.MapGet("/", () => Results.Json(new
     publishedClientPath = publishedClientRoot,
     updatesPath = updatesRoot,
     manifest = "/manifest.json",
-    updaterPlan = "/updater.plan.json"
+    updaterPlan = "/updater.plan.json",
+    updaterBinary = updaterDownloadPath
 }));
 
 app.MapGet("/manifest.json", async () =>
@@ -154,6 +178,20 @@ app.MapGet("/updater-manifest.json", async () =>
     return Results.Text(content, "application/json");
 });
 
+app.MapGet(updaterDownloadPath, () =>
+{
+    var updaterBinaryPath = Path.Combine(publishedUpdaterRoot, options.UpdaterEntryExe);
+    if (!File.Exists(updaterBinaryPath))
+    {
+        return Results.NotFound(new { error = "updater_binary_not_found" });
+    }
+
+    return Results.File(
+        updaterBinaryPath,
+        "application/vnd.microsoft.portable-executable",
+        fileDownloadName: options.UpdaterEntryExe);
+});
+
 // Serve update artifacts from /updates/client/*
 app.UseStaticFiles(new StaticFileOptions
 {
@@ -172,6 +210,38 @@ static string ResolvePath(string configuredPath, string contentRoot)
     }
 
     return Path.GetFullPath(Path.Combine(contentRoot, configuredPath));
+}
+
+static bool IsProtectedUpdateRequest(PathString path, string updaterDownloadPath)
+{
+    return path.StartsWithSegments("/healthz", StringComparison.OrdinalIgnoreCase) ||
+           path.StartsWithSegments("/manifest.json", StringComparison.OrdinalIgnoreCase) ||
+           path.StartsWithSegments("/updater.plan.json", StringComparison.OrdinalIgnoreCase) ||
+           path.StartsWithSegments("/updater-manifest.json", StringComparison.OrdinalIgnoreCase) ||
+           path.StartsWithSegments("/updates/client", StringComparison.OrdinalIgnoreCase);
+}
+
+static string NormalizeRoutePath(string? routePath)
+{
+    if (string.IsNullOrWhiteSpace(routePath))
+    {
+        return "/updater/Smena.Updater.exe";
+    }
+
+    var normalized = routePath.Trim();
+    return normalized.StartsWith('/') ? normalized : "/" + normalized;
+}
+
+static bool HasMatchingApiKey(string? providedApiKey, string expectedApiKey)
+{
+    if (string.IsNullOrWhiteSpace(providedApiKey))
+    {
+        return false;
+    }
+
+    var providedBytes = Encoding.UTF8.GetBytes(providedApiKey.Trim());
+    var expectedBytes = Encoding.UTF8.GetBytes(expectedApiKey);
+    return CryptographicOperations.FixedTimeEquals(providedBytes, expectedBytes);
 }
 
 static FileExtensionContentTypeProvider BuildContentTypeProvider()
@@ -362,24 +432,7 @@ static List<UpdaterEnvVariableDefinition> GetEffectiveEnvDefinitions(UpdateServe
             .ToList();
     }
 
-    return
-    [
-        new UpdaterEnvVariableDefinition
-        {
-            Name = "AVA_SMENA_API_KEY",
-            Prompt = "Введите API ключ",
-            Required = true,
-            Secret = true
-        },
-        new UpdaterEnvVariableDefinition
-        {
-            Name = "AVA_SMENA_GRPC_ADDRESS",
-            Prompt = "Введите адрес gRPC сервера (https://host:port)",
-            Required = true,
-            Secret = false,
-            ValidationPattern = "^https?://.+"
-        }
-    ];
+    return [];
 }
 
 static async Task<string> ComputeDirectoryHashAsync(
@@ -428,6 +481,8 @@ internal sealed class UpdateServerOptions
     public string EntryExe { get; set; } = "Smena.Client.exe";
     public string ProcessName { get; set; } = "Smena.Client";
     public string UpdaterEntryExe { get; set; } = "Smena.Updater.exe";
+    public string UpdaterDownloadPath { get; set; } = "/updater/Smena.Updater.exe";
+    public string? ApiKey { get; set; }
     public string AppDirPolicy { get; set; } = "relativeToUpdater";
     public string AppDirRelativePath { get; set; } = "client";
     public bool CreateAppDirIfMissing { get; set; } = true;
