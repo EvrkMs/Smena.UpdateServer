@@ -2,7 +2,8 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS client-build
 WORKDIR /src
 
 ARG PRIMARY_DOMAIN=localhost
-ARG GRPC_PORT=5001
+ARG GRPC_PATH=/grpc
+ARG GRPC_PORT=
 ARG API_KEY=
 ARG ENTRY_EXE=Smena.Client.exe
 ARG PROCESS_NAME=Smena.Client
@@ -14,11 +15,16 @@ RUN apt-get update \
 COPY ./Smena.Client ./Smena.Client
 RUN dotnet restore Smena.Client/Smena.Client/Smena.Client.csproj
 RUN dotnet publish Smena.Client/Smena.Client/Smena.Client.csproj -c Release -r win-x64 --self-contained false -p:UseAppHost=true -o /artifacts/published-client
-RUN printf '{\n  "Grpc": {\n    "Address": "https://%s:%s",\n    "ApiKey": "%s"\n  }\n}\n' \
-    "$PRIMARY_DOMAIN" \
-    "$GRPC_PORT" \
-    "$API_KEY" \
-    > /artifacts/published-client/appsettings.json
+RUN if [ -n "$GRPC_PORT" ]; then \
+        address="https://${PRIMARY_DOMAIN}:${GRPC_PORT}"; \
+    else \
+        address="https://${PRIMARY_DOMAIN}"; \
+    fi \
+    && printf '{\n  "Grpc": {\n    "Address": "%s",\n    "PathPrefix": "%s",\n    "ApiKey": "%s"\n  }\n}\n' \
+        "$address" \
+        "$GRPC_PATH" \
+        "$API_KEY" \
+        > /artifacts/published-client/appsettings.json
 RUN mkdir -p /artifacts/wwwroot/updates/client/packages
 RUN cd /artifacts/published-client && zip -qr /artifacts/wwwroot/updates/client/packages/client.zip .
 RUN find /artifacts/published-client -type f -printf '%P\n' \

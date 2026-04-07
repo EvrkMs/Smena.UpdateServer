@@ -16,6 +16,10 @@ builder.Services.AddHealthChecks();
 builder.Services.AddHttpClient("client-artifacts");
 
 var app = builder.Build();
+
+// Caddy маршрутизирует /update/* без стрипинга — бэкенд обрабатывает путь сам.
+app.UsePathBase("/update");
+
 var logger = app.Logger;
 
 var options = app.Services.GetRequiredService<IOptions<UpdateServerOptions>>().Value;

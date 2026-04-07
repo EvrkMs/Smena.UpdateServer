@@ -221,9 +221,9 @@ internal sealed class UpdaterOptions
             return false;
         }
 
+        // Preserve path (e.g. /update prefix) but strip query and fragment.
         var builder = new UriBuilder(uri)
         {
-            Path = string.Empty,
             Query = string.Empty,
             Fragment = string.Empty
         };
